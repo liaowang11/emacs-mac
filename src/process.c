@@ -584,6 +584,44 @@ delete_write_fd (int fd)
     }
 }
 
+/* select/pselect can fail with EBADF when a descriptor we are waiting
+   on is closed behind our back -- e.g. a tty in a multi-tty session
+   whose connection is interrupted (the pty is torn down by the peer,
+   or across a sleep/wake cycle) before Emacs notices and runs
+   delete_tty.  Rather than aborting the whole editor, stop monitoring
+   any such now-invalid descriptors so the mask-building code no longer
+   hands them to select; the owning terminal or process is then cleaned
+   up on a later cycle.  Return the number of descriptors pruned.  */
+
+static int
+prune_invalid_wait_descriptors (void)
+{
+  int fd, npruned = 0;
+
+  for (fd = 0; fd <= max_desc; ++fd)
+    {
+      if (fd_callback_info[fd].flags == 0)
+	continue;
+      if (fcntl (fd, F_GETFL) >= 0 || errno != EBADF)
+	continue;
+
+      if ((fd_callback_info[fd].flags & NON_BLOCKING_CONNECT_FD)
+	  && --num_pending_connects < 0)
+	num_pending_connects = 0;
+      fd_callback_info[fd].flags = 0;
+      fd_callback_info[fd].func = 0;
+      fd_callback_info[fd].data = 0;
+      fd_callback_info[fd].thread = NULL;
+      fd_callback_info[fd].waiting_thread = NULL;
+      npruned++;
+    }
+
+  if (npruned > 0)
+    recompute_max_desc ();
+
+  return npruned;
+}
+
 static void
 compute_input_wait_mask (fd_set *mask)
 {
@@ -5380,6 +5418,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
   struct timespec got_output_end_time = invalid_timespec ();
   enum { MINIMUM = -1, TIMEOUT, FOREVER } wait;
   int got_some_output = -1;
+  unsigned int unpruned_badfd_retries = 0;
   uintmax_t prev_wait_proc_nbytes_read = wait_proc ? wait_proc->nbytes_read : 0;
 #if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS
   bool retry_for_async;
@@ -5925,12 +5964,26 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    }
 	}
 
+      if (nfds >= 0 || xerrno != EBADF)
+	unpruned_badfd_retries = 0;
+
       if (nfds < 0)
 	{
 	  if (xerrno == EINTR)
 	    no_avail = 1;
 	  else if (xerrno == EBADF)
-	    emacs_abort ();
+	    {
+	      /* A descriptor we were waiting on was closed out from
+		 under us (e.g. a tty disconnected in a multi-tty
+		 session).  Drop the invalid descriptor(s) and retry
+		 rather than aborting; the owning terminal or process is
+		 cleaned up on a subsequent cycle.  */
+	      if (prune_invalid_wait_descriptors () > 0)
+		unpruned_badfd_retries = 0;
+	      else if (++unpruned_badfd_retries > 1)
+		emacs_abort ();
+	      no_avail = 1;
+	    }
 	  else
 	    report_file_errno ("Failed select", Qnil, xerrno);
 	}
