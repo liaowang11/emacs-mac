@@ -2604,6 +2604,12 @@ macfont_free_entity (Lisp_Object entity)
   unblock_input ();
 }
 
+static short
+read_short_from_os2_table(const UInt8* p)
+{
+  return (p[0] << 8) | p[1];
+}
+
 static Lisp_Object
 macfont_open (struct frame * f, Lisp_Object entity, int pixel_size)
 {
@@ -2751,6 +2757,36 @@ macfont_open (struct frame * f, Lisp_Object entity, int pixel_size)
               ascent += leading;
             }
           CFRelease (family_name);
+        }
+
+      // https://github.com/WebKit/WebKit/blob/4e349ca/Source/WebCore/platform/graphics/coretext/FontCoreText.cpp#L166
+      CFDataRef os2Table = CTFontCopyTable (macfont, kCTFontTableOS2, kCTFontTableOptionNoOptions);
+      if (os2Table)
+        {
+          // For the structure of the OS/2 table, see
+          // https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6OS2.html
+          const CFIndex fsSelectionOffset = 16 * 2 + 10 + 4 * 4 + 4 * 1;
+          const CFIndex sTypoAscenderOffset = fsSelectionOffset + 3 * 2;
+          const CFIndex sTypoDescenderOffset = sTypoAscenderOffset + 2;
+          const CFIndex sTypoLineGapOffset = sTypoDescenderOffset + 2;
+          if (CFDataGetLength (os2Table) >= sTypoLineGapOffset + 2)
+            {
+              const UInt8* os2Data = CFDataGetBytePtr (os2Table);
+              // We test the use typo bit on the least significant byte of fsSelection.
+              //const UInt8 useTypoMetricsMask = 1 << 7;
+              //if (*(os2Data + fsSelectionOffset + 1) & useTypoMetricsMask)
+              // -- XXX: often fonts don't set USE_TYPO_METRICS bit, so just ignore it
+                {
+                  CGFloat unitsPerEm = (CGFloat) CTFontGetUnitsPerEm (macfont);
+                  short sTypoAscender = read_short_from_os2_table (os2Data + sTypoAscenderOffset);
+                  short sTypoDescender = read_short_from_os2_table (os2Data + sTypoDescenderOffset);
+                  short sTypoLineGap = read_short_from_os2_table (os2Data + sTypoLineGapOffset);
+                  ascent = font->pixel_size * sTypoAscender / unitsPerEm;
+                  descent = - font->pixel_size * sTypoDescender / unitsPerEm;
+                  leading = font->pixel_size * sTypoLineGap / unitsPerEm;
+                }
+            }
+          CFRelease(os2Table);
         }
     }
   font->ascent = ascent + 0.5f;
