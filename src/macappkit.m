@@ -9562,10 +9562,12 @@ update_frame_tool_bar (struct frame *f)
   int i, win_gravity = f->output_data.mac->toolbar_win_gravity;
   int pos;
   bool system_symbol_inhibited_p = false;
+  NSMutableArrayOf (void (^) (void)) *itemUpdateBlocks;
 
   block_input ();
 
   window = [frameController emacsWindow];
+  itemUpdateBlocks = [NSMutableArray arrayWithCapacity:0];
   mac_get_frame_window_gravity_reference_bounds (f, win_gravity, &r);
   /* Shrinking the toolbar height with preserving the whole window
      height (e.g., fullheight) seems to be problematic.  */
@@ -9714,33 +9716,38 @@ update_frame_tool_bar (struct frame *f)
       if (!identifier)
 	continue;
 
-      mac_within_gui (^{
-	  NSArrayOf (__kindof NSToolbarItem *) *items = [toolbar items];
-	  NSUInteger count = [items count];
+      /* Defer the toolbar item mutation so all the items are updated
+	 in a single GUI thread synchronization below.  */
+      [itemUpdateBlocks addObject:MRC_AUTORELEASE ([^{
+	      NSArrayOf (__kindof NSToolbarItem *) *items = [toolbar items];
+	      NSUInteger count = [items count];
 
-	  if (pos >= count
-	      || ![identifier isEqualToString:[items[pos] itemIdentifier]])
-	    {
-	      [toolbar insertItemWithItemIdentifier:identifier atIndex:pos];
-	      items = [toolbar items];
-	      count = [items count];
-	    }
+	      if (pos >= count
+		  || ![identifier isEqualToString:[items[pos] itemIdentifier]])
+		{
+		  [toolbar insertItemWithItemIdentifier:identifier atIndex:pos];
+		  items = [toolbar items];
+		  count = [items count];
+		}
 
-	  EmacsToolbarItem *item = items[pos];
+	      EmacsToolbarItem *item = items[pos];
 
-	  if (systemSymbol)
-	    item.image = systemSymbol;
-	  else
-	    [item setCoreGraphicsImages:cgImages];
-	  [item setLabel:label];
-	  [item setEnabled:(enabled_p || idx >= 0)];
-	  [item setTag:i];
-	});
+	      if (systemSymbol)
+		item.image = systemSymbol;
+	      else
+		[item setCoreGraphicsImages:cgImages];
+	      [item setLabel:label];
+	      [item setEnabled:(enabled_p || idx >= 0)];
+	      [item setTag:i];
+	    } copy])];
       pos++;
 #undef PROP
     }
 
   mac_within_gui (^{
+      for (void (^updateBlock) (void) in itemUpdateBlocks)
+	updateBlock ();
+
       NSUInteger count = [[toolbar items] count];
 #if 0
       /* This leads to the problem that the toolbar space right to the
@@ -10451,13 +10458,39 @@ mac_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	  mac_screen_config_changed = 0;
 	}
 
+      /* Flush all the frames in a single GUI thread synchronization,
+	 rather than one synchronization per frame as mac_force_flush
+	 would do.  */
+      mac_within_gui (^{
+	  Lisp_Object tail1, frame1;
+
+	  FOR_EACH_FRAME (tail1, frame1)
+	    {
+	      struct frame *f = XFRAME (frame1);
+
+	      if (FRAME_MAC_P (f))
+		{
+#if MAC_OS_X_VERSION_MIN_REQUIRED < 101400
+		  if (!FRAME_MAC_DOUBLE_BUFFERED_P (f))
+		    {
+		      EmacsWindow *window = FRAME_MAC_WINDOW_OBJECT (f);
+
+		      if (window.isVisible)
+			[window flushWindow];
+		    }
+		  else
+#endif
+		    [FRAME_CONTROLLER (f) displayEmacsViewIfNeeded];
+		}
+	    }
+	});
+
       FOR_EACH_FRAME (tail, frame)
 	{
 	  struct frame *f = XFRAME (frame);
 
 	  if (FRAME_MAC_P (f))
 	    {
-	      mac_force_flush (f);
 	      /* Check which frames are still visible.  We do this
 		 here because there doesn't seem to be any direct
 		 notification that the visibility of a window has
