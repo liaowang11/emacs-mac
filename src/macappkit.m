@@ -1351,10 +1351,11 @@ static bool handling_queued_nsevents_p;
   macfont_update_antialias_threshold ();
 }
 
-- (void)willSleep:(NSNotification *)notification {
-  // Do quick pre-sleep work here
-  NSLog(@"Entering sleep");
-  mac_draw_queue_sync();
+- (void)willSleep:(NSNotification *)notification
+{
+  /* Make sure no drawing is left in flight on the drawing queue
+     before the machine goes to sleep.  */
+  mac_draw_queue_sync ();
 }
 
 - (void)updateObservedKeyPaths
@@ -7146,9 +7147,15 @@ event_phase_to_symbol (NSEventPhase phase)
       keyEventsInterpreted = YES;
       rawKeyEvent = theEvent;
       rawKeyEventHasMappedFlags = (mapped_flags != 0);
-      [self interpretKeyEvents:@[theEvent]];
-      rawKeyEvent = nil;
-      rawKeyEventHasMappedFlags = NO;
+      @try
+	{
+	  [self interpretKeyEvents:@[theEvent]];
+	}
+      @finally
+	{
+	  rawKeyEvent = nil;
+	  rawKeyEventHasMappedFlags = NO;
+	}
       if (keyEventsInterpreted)
 	return;
     }
@@ -10810,22 +10817,16 @@ mac_font_dialog (struct frame *f)
       if (response != NSModalResponseAbort)
 	{
 	  selectedFont = [fontManager convertFont:[fontManager selectedFont]];
-	  if (selectedFont == nil) {
-	    NSLog(@"Font conversion failed");
-	  } else {
+	  if (selectedFont)
 	    result = macfont_nsctfont_to_spec ((__bridge void *) selectedFont);
-	  }
 	}
 
       [fontPanel setAccessoryView:savedAccessoryView];
       [fontPanel setDelegate:savedDelegate];
       MRC_RELEASE (delegate);
-      if (savedSelectedFont != nil) {
+      if (savedSelectedFont)
 	[fontManager setSelectedFont:savedSelectedFont
 			  isMultiple:savedIsMultiple];
-      } else {
-	NSLog(@"No saved font selection, skipping");
-      }
       MRC_RELEASE (savedSelectedFont);
       [fontPanel close];
     });
@@ -12490,15 +12491,10 @@ mac_put_selection_value (Selection sel, Lisp_Object target, Lisp_Object value)
 
   [pboard addTypes:@[dataType] owner:nil];
 
-  if (dataType == nil)
-    return noTypeErr;
-  else
-    {
-      NSData *data = [NSData dataWithBytes:(SDATA (value))
-				    length:(SBYTES (value))];
+  NSData *data = [NSData dataWithBytes:(SDATA (value))
+				length:(SBYTES (value))];
 
-      return [pboard setData:data forType:dataType] ? noErr : noTypeErr;
-    }
+  return [pboard setData:data forType:dataType] ? noErr : noTypeErr;
 }
 
 /* Check if data for the target type TARGET is available in SEL.  */
