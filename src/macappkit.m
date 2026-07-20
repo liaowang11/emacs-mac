@@ -253,6 +253,9 @@ static bool mac_select_allow_lisp_evaluation;
 
   @synchronized (self)
   {
+    if ([self count] == 0)
+      return nil;
+
     obj = self[0];
     obj = (obj == NSNull.null) ? nil : MRC_AUTORELEASE (MRC_RETAIN (obj));
     [self removeObjectAtIndex:0];
@@ -5865,8 +5868,12 @@ mac_iosurface_create (size_t width, size_t height)
   scaleFactor = view.window.backingScaleFactor;
 
   NSSize size = view.bounds.size;
-  size_t width = size.width * scaleFactor;
-  size_t height = size.height * scaleFactor;
+  /* A bitmap context cannot be created with zero dimensions.  Clamp
+     them so a zero-sized view still gets a valid backing; it will be
+     recreated with the right size when the view is resized (see
+     viewFrameDidChange:).  */
+  size_t width = MAX (size.width * scaleFactor, 1);
+  size_t height = MAX (size.height * scaleFactor, 1);
   NSColorSpace *colorSpace = view.window.colorSpace;
   CGColorSpaceRef color_space = (colorSpace ? colorSpace.CGColorSpace
 				 /* The window does not have a backing
@@ -5894,6 +5901,24 @@ mac_iosurface_create (size_t width, size_t height)
 					     smoothing.  */
 					  (kCGImageAlphaPremultipliedFirst
 					   | kCGBitmapByteOrder32Host));
+      if (bitmaps[i] == NULL)
+	{
+	  /* Clean up the resources created so far and fail.  */
+	  int j;
+
+	  for (j = 0; j <= i; j++)
+	    {
+	      if (bitmaps[j])
+		CGContextRelease (bitmaps[j]);
+	      if (surfaces[j])
+		{
+		  IOSurfaceUnlock (surfaces[j], 0, NULL);
+		  CFRelease (surfaces[j]);
+		}
+	    }
+	  MRC_RELEASE (self);
+	  return nil;
+	}
       CGContextTranslateCTM (bitmaps[i], 0, height);
       CGContextScaleCTM (bitmaps[i], scaleFactor, - scaleFactor);
       if (!surfaces[i])
@@ -8598,13 +8623,16 @@ static BOOL NonmodalScrollerPagingBehavior;
 	  else
 	    maximum = NSWidth (knobSlotRect) - NSWidth (KnobRect);
 
-	  minEdge = knobMinEdgeInSlot;
-	  if (minEdge < 0)
-	    minEdge = 0;
-	  if (minEdge > maximum)
-	    minEdge = maximum;
+	  if (maximum > 0)
+	    {
+	      minEdge = knobMinEdgeInSlot;
+	      if (minEdge < 0)
+		minEdge = 0;
+	      if (minEdge > maximum)
+		minEdge = maximum;
 
-	  [self setDoubleValue:minEdge/maximum];
+	      [self setDoubleValue:(minEdge / maximum)];
+	    }
 	}
 
       [self sendAction:[self action] to:[self target]];
@@ -15691,6 +15719,14 @@ ax_get_bounds_for_range_1 (EmacsMainView *emacsView, NSRange range)
     {
       NSRect rect1;
 
+      /* Bail out on a degenerate actual range that is not contained
+	 in the requested range or does not advance, so as to avoid
+	 unbounded recursion or iteration.  */
+      if (actualRange.location < range.location
+	  || NSMaxRange (actualRange) > NSMaxRange (range)
+	  || NSMaxRange (actualRange) <= range.location)
+	break;
+
       if (actualRange.location > range.location)
 	{
 	  NSRange range1 = NSMakeRange (range.location,
@@ -16773,7 +16809,14 @@ mac_init_thread_synchronization (void)
 
 /* Keep synchronously executing blocks in `mac_gui_queue', which has
    been set by `mac_within_gui_and_here', in the GUI thread until the
-   dequeued block is nil.  */
+   dequeued block is nil.
+
+   A nil block terminates the innermost mac_gui_loop.  It is only
+   enqueued (via `mac_within_gui (nil)') while the GUI thread is known
+   to be inside a mac_gui_loop nested in `mac_within_lisp'.  If a nil
+   block ever reached the top-level mac_gui_loop in main, it would
+   return and Emacs would abort.  If it reached mac_gui_loop_once,
+   that would be a protocol violation, and it aborts explicitly.  */
 
 static void
 mac_gui_loop (void)
@@ -16802,7 +16845,10 @@ mac_gui_loop_once (void)
   BEGIN_AUTORELEASE_POOL;
   dispatch_semaphore_wait (mac_gui_semaphore, DISPATCH_TIME_FOREVER);
   block = [mac_gui_queue dequeue];
-  eassert (block);
+  if (block == nil)
+    /* A nil block is reserved for terminating a mac_gui_loop nested
+       in mac_within_lisp.  It must never reach this consumer.  */
+    emacs_abort ();
   block ();
   dispatch_semaphore_signal (mac_lisp_semaphore);
   END_AUTORELEASE_POOL;
