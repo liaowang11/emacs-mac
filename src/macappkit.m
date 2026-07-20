@@ -14255,6 +14255,10 @@ static NSDate *documentRasterizerCacheOldestTimestamp;
 
 @implementation EmacsSVGDocument
 
+/* Upper bound in seconds for waiting on web view load or snapshot
+   completion while pumping the run loop.  */
+#define SVG_WEB_VIEW_DEADLINE_INTERVAL 15
+
 /* WebView object that was used in the last deallocated
    EmacsSVGDocument object.  This is reused to avoid the overhead of
    WebView object creation.  */
@@ -14496,9 +14500,40 @@ static WebView *EmacsSVGDocumentLastWebView;
 #endif  /* !USE_WK_API */
 
   /* webView.isLoading is not sufficient if we have <image
-     xlink:href=... /> */
-  while (!finished)
-    mac_run_loop_run_once (0);
+     xlink:href=... />.  Pump the run loop until the navigation
+     finishes or fails, but give up after a deadline so a load
+     failure cannot leave us waiting forever.  */
+  {
+    NSDate *deadline =
+      [NSDate dateWithTimeIntervalSinceNow:SVG_WEB_VIEW_DEADLINE_INTERVAL];
+
+    while (!finished && !navigationFailed)
+      {
+	NSTimeInterval remaining = [deadline timeIntervalSinceNow];
+
+	if (remaining <= 0)
+	  break;
+	mac_run_loop_run_once (min (remaining, 0.1));
+      }
+
+    if (!finished && !navigationFailed)
+      {
+	/* The navigation is still in flight after the deadline.  Stop
+	   it, detach the delegate, and discard the web view so its
+	   late callbacks cannot affect the next document that would
+	   reuse the shared web view.  */
+#ifdef USE_WK_API
+	[webView stopLoading];
+	webView.navigationDelegate = nil;
+	self.finishNavigationHandler = nil;
+#else
+	[webView stopLoading:nil];
+	webView.frameLoadDelegate = nil;
+	self.finishLoadForFrameHandler = nil;
+#endif
+	EmacsSVGDocumentLastWebView = nil;
+      }
+  }
 
   int width = -1, height;
 #ifdef USE_WK_API
@@ -14649,6 +14684,7 @@ static WebView *EmacsSVGDocumentLastWebView;
       ctm = CGAffineTransformConcat (flip, ctm);
 
       BOOL __block finished = NO;
+      BOOL __block stale = NO;
       NSImage * __block image = nil;
       int destWidth = NSWidth (destRect), destHeight = NSHeight (destRect);
       NSString *script = [NSString stringWithFormat:@""
@@ -14666,7 +14702,13 @@ static WebView *EmacsSVGDocumentLastWebView;
 
       [webView evaluateJavaScript:script
 		completionHandler:^(id scriptResult, NSError *error) {
-	  if (!error)
+	  if (stale)
+	    /* The request already timed out.  */
+	    return;
+	  if (error)
+	    /* Give up drawing this page; image remains nil.  */
+	    finished = YES;
+	  else
 	    {
 	      WKSnapshotConfiguration *snapshotConfiguration =
 		[[WKSnapshotConfiguration alloc] init];
@@ -14676,6 +14718,9 @@ static WebView *EmacsSVGDocumentLastWebView;
 	      [webView takeSnapshotWithConfiguration:snapshotConfiguration
 				   completionHandler:^(NSImage *snapshotImage,
 						       NSError *error) {
+		  if (stale)
+		    /* The request already timed out.  */
+		    return;
 		  image = MRC_RETAIN (snapshotImage);
 		  finished = YES;
 		}];
@@ -14683,8 +14728,27 @@ static WebView *EmacsSVGDocumentLastWebView;
 	    }
 	}];
 
-      while (!finished)
-	mac_run_loop_run_once (0);
+      /* Pump the run loop until the snapshot completes, but give up
+	 after a deadline so an error cannot leave us waiting
+	 forever.  */
+      {
+	NSDate *deadline =
+	  [NSDate dateWithTimeIntervalSinceNow:SVG_WEB_VIEW_DEADLINE_INTERVAL];
+
+	while (!finished)
+	  {
+	    NSTimeInterval remaining = [deadline timeIntervalSinceNow];
+
+	    if (remaining <= 0)
+	      break;
+	    mac_run_loop_run_once (min (remaining, 0.1));
+	  }
+      }
+
+      /* Make any late completion handlers no-ops.  The shared web
+	 view may be in use for another page by now, and on non-ARC
+	 builds a late snapshot would also leak the retained image.  */
+      stale = YES;
 
       if (image)
 	{
@@ -14738,6 +14802,18 @@ static WebView *EmacsSVGDocumentLastWebView;
       finishNavigationHandler (view, navigation);
       self.finishNavigationHandler = nil;
     }
+}
+
+- (void)webView:(WKWebView *)view didFailNavigation:(WKNavigation *)navigation
+      withError:(NSError *)error
+{
+  navigationFailed = YES;
+}
+
+- (void)webView:(WKWebView *)view didFailProvisionalNavigation:(WKNavigation *)navigation
+      withError:(NSError *)error
+{
+  navigationFailed = YES;
 }
 
 - (void)webView:(WKWebView *)view startURLSchemeTask:(id <WKURLSchemeTask>)urlSchemeTask
@@ -14819,6 +14895,18 @@ static WebView *EmacsSVGDocumentLastWebView;
       finishLoadForFrameHandler (sender, frame);
       self.finishLoadForFrameHandler = nil;
     }
+}
+
+- (void)webView:(WebView *)sender didFailLoadWithError:(NSError *)error
+       forFrame:(WebFrame *)frame
+{
+  navigationFailed = YES;
+}
+
+- (void)webView:(WebView *)sender didFailProvisionalLoadWithError:(NSError *)error
+       forFrame:(WebFrame *)frame
+{
+  navigationFailed = YES;
 }
 #endif
 
