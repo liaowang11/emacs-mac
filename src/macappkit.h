@@ -1196,6 +1196,9 @@ typedef NSInteger NSGlyphProperty;
 
   /* Rectangle shown as the SVG image within webView.  */
   NSRect viewRect;
+
+  /* Whether navigation of webView has failed before finishing.  */
+  BOOL navigationFailed;
 }
 @end
 
