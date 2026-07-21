@@ -2740,8 +2740,11 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame,
       store_frame_param (f, Qvisibility, visibility);
     }
 
-  /* Works iff frame has been already mapped.  */
-  gui_default_parameter (f, parms, Qskip_taskbar, Qnil,
+  /* Works iff frame has been already mapped.  Child frames are
+     transient by nature, so default to hiding them from the Window
+     menu.  */
+  gui_default_parameter (f, parms, Qskip_taskbar,
+                         NILP (parent_frame) ? Qnil : Qt,
                          NULL, NULL, RES_TYPE_BOOLEAN);
   /* The `z-group' parameter works only for visible frames.  */
   gui_default_parameter (f, parms, Qz_group, Qnil,
