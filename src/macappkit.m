@@ -2114,6 +2114,20 @@ mac_with_suppressed_transparent_titlebar( NSWindow* window, BOOL assumeTranspare
   return self.isVisible && self.parentWindow == nil;
 }
 
+- (NSString *)accessibilitySubrole
+{
+  /* A child frame is a transient, floating window.  Report it as
+     such so accessibility clients (e.g., tiling window managers)
+     can classify it accordingly, as the NS port does.  The check is
+     dynamic because the parent/child relationship can change
+     outside mac_update_frame_window_parent (e.g., when the window
+     is replaced in setupWindow).  */
+  if (self.parentWindow != nil)
+    return NSAccessibilityFloatingWindowSubrole;
+  else
+    return [super accessibilitySubrole];
+}
+
 - (void)setFrame:(NSRect)windowFrame display:(BOOL)displayViews
 {
   if (self.hasTitleBar)
