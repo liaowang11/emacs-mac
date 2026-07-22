@@ -49,8 +49,8 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #ifdef HAVE_SETRLIMIT
 # include <sys/resource.h>
 
-/* If NOFILE_LIMIT.rlim_cur is greater than FD_SETSIZE, then
-   NOFILE_LIMIT is the initial limit on the number of open files,
+/* If NOFILE_LIMIT.rlim_cur is nonzero, Emacs changed the soft limit
+   on the number of open files, and NOFILE_LIMIT is the initial limit,
    which should be restored in child processes.  */
 static struct rlimit nofile_limit;
 #endif
@@ -8759,7 +8759,7 @@ void
 restore_nofile_limit (void)
 {
 #ifdef HAVE_SETRLIMIT
-  if (FD_SETSIZE < nofile_limit.rlim_cur)
+  if (nofile_limit.rlim_cur != 0)
     setrlimit (RLIMIT_NOFILE, &nofile_limit);
 #endif
 }
@@ -8827,14 +8827,21 @@ init_process_emacs (int sockfd)
 #endif
 
 #ifdef HAVE_SETRLIMIT
-  /* Don't allocate more than FD_SETSIZE file descriptors for Emacs itself.  */
+  /* Give Emacs itself FD_SETSIZE file descriptors, raising or
+     lowering the soft limit as the hard limit permits; more would be
+     unusable with select, fewer starves file watchers on large
+     projects.  Subprocesses get the original limit back; see
+     restore_nofile_limit.  */
   if (getrlimit (RLIMIT_NOFILE, &nofile_limit) != 0)
     nofile_limit.rlim_cur = 0;
-  else if (FD_SETSIZE < nofile_limit.rlim_cur)
+  else
     {
       struct rlimit rlim = nofile_limit;
       rlim.rlim_cur = FD_SETSIZE;
-      if (setrlimit (RLIMIT_NOFILE, &rlim) != 0)
+      if (rlim.rlim_max != RLIM_INFINITY && rlim.rlim_max < rlim.rlim_cur)
+	rlim.rlim_cur = rlim.rlim_max;
+      if (rlim.rlim_cur == nofile_limit.rlim_cur
+	  || setrlimit (RLIMIT_NOFILE, &rlim) != 0)
 	nofile_limit.rlim_cur = 0;
     }
 #endif
