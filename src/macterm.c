@@ -2978,6 +2978,7 @@ mac_mouse_position (struct frame **fp, int insist, Lisp_Object *bar_window,
 {
   struct frame *f1;
   struct mac_display_info *dpyinfo = FRAME_DISPLAY_INFO (*fp);
+  struct frame *sf = SELECTED_FRAME ();
   bool return_no_frame_flag = false;
 
   block_input ();
@@ -3017,7 +3018,7 @@ mac_mouse_position (struct frame **fp, int insist, Lisp_Object *bar_window,
 	f1 = XFRAME (mac_event_frame ());
     }
 
-  if (f1)
+  if (f1 && sf->output_method != output_termcap)
     {
       /* Ok, we found a frame.  Store all the values.
 	 last_mouse_glyph is a rectangle used to reduce the generation

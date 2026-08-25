@@ -22,6 +22,7 @@ along with GNU Emacs Mac port.  If not, see <https://www.gnu.org/licenses/>.  */
 
 #include "macterm.h"
 
+#include <AppKit/AppKit.h>
 #include <sys/socket.h>
 
 #include "character.h"
@@ -252,6 +253,9 @@ static bool mac_select_allow_lisp_evaluation;
 
   @synchronized (self)
   {
+    if ([self count] == 0)
+      return nil;
+
     obj = self[0];
     obj = (obj == NSNull.null) ? nil : MRC_AUTORELEASE (MRC_RETAIN (obj));
     [self removeObjectAtIndex:0];
@@ -1325,10 +1329,11 @@ static bool handling_queued_nsevents_p;
   macfont_update_antialias_threshold ();
 }
 
-- (void)willSleep:(NSNotification *)notification {
-  // Do quick pre-sleep work here
-  NSLog(@"Entering sleep");
-  mac_draw_queue_sync();
+- (void)willSleep:(NSNotification *)notification
+{
+  /* Make sure no drawing is left in flight on the drawing queue
+     before the machine goes to sleep.  */
+  mac_draw_queue_sync ();
 }
 
 - (void)updateObservedKeyPaths
@@ -2087,6 +2092,20 @@ mac_with_suppressed_transparent_titlebar( NSWindow* window, BOOL assumeTranspare
   return self.isVisible && self.parentWindow == nil;
 }
 
+- (NSString *)accessibilitySubrole
+{
+  /* A child frame is a transient, floating window.  Report it as
+     such so accessibility clients (e.g., tiling window managers)
+     can classify it accordingly, as the NS port does.  The check is
+     dynamic because the parent/child relationship can change
+     outside mac_update_frame_window_parent (e.g., when the window
+     is replaced in setupWindow).  */
+  if (self.parentWindow != nil)
+    return NSAccessibilityFloatingWindowSubrole;
+  else
+    return [super accessibilitySubrole];
+}
+
 - (void)setFrame:(NSRect)windowFrame display:(BOOL)displayViews
 {
   if (self.hasTitleBar)
@@ -2595,6 +2614,11 @@ mac_with_suppressed_transparent_titlebar( NSWindow* window, BOOL assumeTranspare
   else
     windowStyle = NSWindowStyleMaskBorderless;
 
+  if (FRAME_UNDECORATED_ROUND (f))
+    {
+      windowStyle |= NSFullSizeContentViewWindowMask;
+    }
+
   if (oldWindow == nil)
     {
       NSScreen *screen = nil;
@@ -2726,6 +2750,14 @@ mac_with_suppressed_transparent_titlebar( NSWindow* window, BOOL assumeTranspare
       [window setIgnoresMouseEvents:YES];
       [window setExcludedFromWindowsMenu:YES];
       window.animationBehavior = NSWindowAnimationBehaviorNone;
+    }
+  if (FRAME_UNDECORATED_ROUND (f))
+    {
+      [window setTitlebarAppearsTransparent:YES];
+      [window setTitleVisibility:NSWindowTitleHidden];
+      [[window standardWindowButton:NSWindowCloseButton] setHidden:YES];
+      [[window standardWindowButton:NSWindowMiniaturizeButton] setHidden:YES];
+      [[window standardWindowButton:NSWindowZoomButton] setHidden:YES];
     }
 }
 
@@ -4301,10 +4333,10 @@ mac_with_suppressed_transparent_titlebar( NSWindow* window, BOOL assumeTranspare
 - (void)updateWindowStyle
 {
   BOOL shouldBeTitled = self.shouldBeTitled;
+  struct frame *f = emacsFrame;
 
   if (emacsWindow.hasTitleBar != shouldBeTitled)
     {
-      struct frame *f = emacsFrame;
       Lisp_Object tool_bar_lines = get_frame_param (f, Qtool_bar_lines);
 
       if (FIXNUMP (tool_bar_lines) && XFIXNUM (tool_bar_lines) > 0)
@@ -4318,6 +4350,11 @@ mac_with_suppressed_transparent_titlebar( NSWindow* window, BOOL assumeTranspare
 	    gui_set_frame_parameters (f, list1 (Fcons (Qtool_bar_lines,
 						       tool_bar_lines)));
 	  });
+      [self setupWindow];
+    }
+
+  if (([emacsWindow styleMask] & NSFullSizeContentViewWindowMask) != FRAME_UNDECORATED_ROUND (f))
+    {
       [self setupWindow];
     }
 
@@ -5824,8 +5861,12 @@ mac_iosurface_create (size_t width, size_t height)
   scaleFactor = view.window.backingScaleFactor;
 
   NSSize size = view.bounds.size;
-  size_t width = size.width * scaleFactor;
-  size_t height = size.height * scaleFactor;
+  /* A bitmap context cannot be created with zero dimensions.  Clamp
+     them so a zero-sized view still gets a valid backing; it will be
+     recreated with the right size when the view is resized (see
+     viewFrameDidChange:).  */
+  size_t width = MAX (size.width * scaleFactor, 1);
+  size_t height = MAX (size.height * scaleFactor, 1);
   NSColorSpace *colorSpace = view.window.colorSpace;
   CGColorSpaceRef color_space = (colorSpace ? colorSpace.CGColorSpace
 				 /* The window does not have a backing
@@ -5853,6 +5894,24 @@ mac_iosurface_create (size_t width, size_t height)
 					     smoothing.  */
 					  (kCGImageAlphaPremultipliedFirst
 					   | kCGBitmapByteOrder32Host));
+      if (bitmaps[i] == NULL)
+	{
+	  /* Clean up the resources created so far and fail.  */
+	  int j;
+
+	  for (j = 0; j <= i; j++)
+	    {
+	      if (bitmaps[j])
+		CGContextRelease (bitmaps[j]);
+	      if (surfaces[j])
+		{
+		  IOSurfaceUnlock (surfaces[j], 0, NULL);
+		  CFRelease (surfaces[j]);
+		}
+	    }
+	  MRC_RELEASE (self);
+	  return nil;
+	}
       CGContextTranslateCTM (bitmaps[i], 0, height);
       CGContextScaleCTM (bitmaps[i], scaleFactor, - scaleFactor);
       if (!surfaces[i])
@@ -7080,9 +7139,15 @@ event_phase_to_symbol (NSEventPhase phase)
       keyEventsInterpreted = YES;
       rawKeyEvent = theEvent;
       rawKeyEventHasMappedFlags = (mapped_flags != 0);
-      [self interpretKeyEvents:@[theEvent]];
-      rawKeyEvent = nil;
-      rawKeyEventHasMappedFlags = NO;
+      @try
+	{
+	  [self interpretKeyEvents:@[theEvent]];
+	}
+      @finally
+	{
+	  rawKeyEvent = nil;
+	  rawKeyEventHasMappedFlags = NO;
+	}
       if (keyEventsInterpreted)
 	return;
     }
@@ -7321,9 +7386,10 @@ event_phase_to_symbol (NSEventPhase phase)
 	      start_charpos = BUF_BEGV (b) + range.location;
 	      end_charpos = start_charpos + range.length;
 	      [attributedString beginEditing];
-	      [attributedString addAttribute:NSFontAttributeName
-				       value:lastFont
-				       range:(NSMakeRange (0, range.length))];
+	      if (lastFont)
+		[attributedString addAttribute:NSFontAttributeName
+					 value:lastFont
+					 range:(NSMakeRange (0, range.length))];
 	      rows_from_pos_range (w, start_charpos, end_charpos, Qnil,
 				   &r1, &r2);
 	      if (r1 == NULL || r2 == NULL)
@@ -7369,9 +7435,10 @@ event_phase_to_symbol (NSEventPhase phase)
 				[NSFont fontWithFace:(FACE_FROM_ID
 						      (f, last_face_id))];
 			    }
-			  [attributedString addAttribute:NSFontAttributeName
-						   value:lastFont
-						   range:attributeRange];
+			  if (lastFont)
+			    [attributedString addAttribute:NSFontAttributeName
+						     value:lastFont
+						     range:attributeRange];
 			}
 		  }
 	      [attributedString endEditing];
@@ -7549,29 +7616,36 @@ mac_ts_active_input_string_in_echo_area_p (struct frame *f)
   point = [frameController convertEmacsViewPointFromScreen:thePoint];
   x = point.x;
   y = point.y;
-  window = window_from_coordinates (f, x, y, &part, false, false, false);
-  if (!WINDOWP (window) || !EQ (window, f->selected_window))
+
+  /* Might be called during the select emulation.  */
+  if (!mac_try_buffer_and_glyph_matrix_access ())
     return result;
 
-  /* Convert to window-relative pixel coordinates.  */
-  w = XWINDOW (window);
-  frame_to_window_pixel_xy (w, &x, &y);
-
-  /* Are we in a window whose display is up to date?
-     And verify the buffer's text has not changed.  */
-  b = XBUFFER (w->contents);
-  if (part == ON_TEXT && w->window_end_valid && !window_outdated (w))
+  window = window_from_coordinates (f, x, y, &part, false, false, false);
+  if (WINDOWP (window) && EQ (window, f->selected_window))
     {
-      int hpos, vpos, area;
-      struct glyph *glyph;
+      /* Convert to window-relative pixel coordinates.  */
+      w = XWINDOW (window);
+      frame_to_window_pixel_xy (w, &x, &y);
 
-      /* Find the glyph under X/Y.  */
-      glyph = x_y_to_hpos_vpos (w, x, y, &hpos, &vpos, 0, 0, &area);
+      /* Are we in a window whose display is up to date?
+	 And verify the buffer's text has not changed.  */
+      b = XBUFFER (w->contents);
+      if (part == ON_TEXT && w->window_end_valid && !window_outdated (w))
+	{
+	  int hpos, vpos, area;
+	  struct glyph *glyph;
 
-      if (glyph != NULL && area == TEXT_AREA
-	  && BUFFERP (glyph->object) && glyph->charpos <= BUF_Z (b))
-	result = glyph->charpos - BUF_BEGV (b);
+	  /* Find the glyph under X/Y.  */
+	  glyph = x_y_to_hpos_vpos (w, x, y, &hpos, &vpos, 0, 0, &area);
+
+	  if (glyph != NULL && area == TEXT_AREA
+	      && BUFFERP (glyph->object) && glyph->charpos <= BUF_Z (b))
+	    result = glyph->charpos - BUF_BEGV (b);
+	}
     }
+
+  mac_end_buffer_and_glyph_matrix_access ();
 
   return result;
 }
@@ -8557,13 +8631,16 @@ static BOOL NonmodalScrollerPagingBehavior;
 	  else
 	    maximum = NSWidth (knobSlotRect) - NSWidth (KnobRect);
 
-	  minEdge = knobMinEdgeInSlot;
-	  if (minEdge < 0)
-	    minEdge = 0;
-	  if (minEdge > maximum)
-	    minEdge = maximum;
+	  if (maximum > 0)
+	    {
+	      minEdge = knobMinEdgeInSlot;
+	      if (minEdge < 0)
+		minEdge = 0;
+	      if (minEdge > maximum)
+		minEdge = maximum;
 
-	  [self setDoubleValue:minEdge/maximum];
+	      [self setDoubleValue:(minEdge / maximum)];
+	    }
 	}
 
       [self sendAction:[self action] to:[self target]];
@@ -9477,10 +9554,12 @@ update_frame_tool_bar (struct frame *f)
   int i, win_gravity = f->output_data.mac->toolbar_win_gravity;
   int pos;
   bool system_symbol_inhibited_p = false;
+  NSMutableArrayOf (void (^) (void)) *itemUpdateBlocks;
 
   block_input ();
 
   window = [frameController emacsWindow];
+  itemUpdateBlocks = [NSMutableArray arrayWithCapacity:0];
   mac_get_frame_window_gravity_reference_bounds (f, win_gravity, &r);
   /* Shrinking the toolbar height with preserving the whole window
      height (e.g., fullheight) seems to be problematic.  */
@@ -9629,33 +9708,38 @@ update_frame_tool_bar (struct frame *f)
       if (!identifier)
 	continue;
 
-      mac_within_gui (^{
-	  NSArrayOf (__kindof NSToolbarItem *) *items = [toolbar items];
-	  NSUInteger count = [items count];
+      /* Defer the toolbar item mutation so all the items are updated
+	 in a single GUI thread synchronization below.  */
+      [itemUpdateBlocks addObject:MRC_AUTORELEASE ([^{
+	      NSArrayOf (__kindof NSToolbarItem *) *items = [toolbar items];
+	      NSUInteger count = [items count];
 
-	  if (pos >= count
-	      || ![identifier isEqualToString:[items[pos] itemIdentifier]])
-	    {
-	      [toolbar insertItemWithItemIdentifier:identifier atIndex:pos];
-	      items = [toolbar items];
-	      count = [items count];
-	    }
+	      if (pos >= count
+		  || ![identifier isEqualToString:[items[pos] itemIdentifier]])
+		{
+		  [toolbar insertItemWithItemIdentifier:identifier atIndex:pos];
+		  items = [toolbar items];
+		  count = [items count];
+		}
 
-	  EmacsToolbarItem *item = items[pos];
+	      EmacsToolbarItem *item = items[pos];
 
-	  if (systemSymbol)
-	    item.image = systemSymbol;
-	  else
-	    [item setCoreGraphicsImages:cgImages];
-	  [item setLabel:label];
-	  [item setEnabled:(enabled_p || idx >= 0)];
-	  [item setTag:i];
-	});
+	      if (systemSymbol)
+		item.image = systemSymbol;
+	      else
+		[item setCoreGraphicsImages:cgImages];
+	      [item setLabel:label];
+	      [item setEnabled:(enabled_p || idx >= 0)];
+	      [item setTag:i];
+	    } copy])];
       pos++;
 #undef PROP
     }
 
   mac_within_gui (^{
+      for (void (^updateBlock) (void) in itemUpdateBlocks)
+	updateBlock ();
+
       NSUInteger count = [[toolbar items] count];
 #if 0
       /* This leads to the problem that the toolbar space right to the
@@ -10366,13 +10450,39 @@ mac_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	  mac_screen_config_changed = 0;
 	}
 
+      /* Flush all the frames in a single GUI thread synchronization,
+	 rather than one synchronization per frame as mac_force_flush
+	 would do.  */
+      mac_within_gui (^{
+	  Lisp_Object tail1, frame1;
+
+	  FOR_EACH_FRAME (tail1, frame1)
+	    {
+	      struct frame *f = XFRAME (frame1);
+
+	      if (FRAME_MAC_P (f))
+		{
+#if MAC_OS_X_VERSION_MIN_REQUIRED < 101400
+		  if (!FRAME_MAC_DOUBLE_BUFFERED_P (f))
+		    {
+		      EmacsWindow *window = FRAME_MAC_WINDOW_OBJECT (f);
+
+		      if (window.isVisible)
+			[window flushWindow];
+		    }
+		  else
+#endif
+		    [FRAME_CONTROLLER (f) displayEmacsViewIfNeeded];
+		}
+	    }
+	});
+
       FOR_EACH_FRAME (tail, frame)
 	{
 	  struct frame *f = XFRAME (frame);
 
 	  if (FRAME_MAC_P (f))
 	    {
-	      mac_force_flush (f);
 	      /* Check which frames are still visible.  We do this
 		 here because there doesn't seem to be any direct
 		 notification that the visibility of a window has
@@ -10732,22 +10842,16 @@ mac_font_dialog (struct frame *f)
       if (response != NSModalResponseAbort)
 	{
 	  selectedFont = [fontManager convertFont:[fontManager selectedFont]];
-	  if (selectedFont == nil) {
-	    NSLog(@"Font conversion failed");
-	  } else {
+	  if (selectedFont)
 	    result = macfont_nsctfont_to_spec ((__bridge void *) selectedFont);
-	  }
 	}
 
       [fontPanel setAccessoryView:savedAccessoryView];
       [fontPanel setDelegate:savedDelegate];
       MRC_RELEASE (delegate);
-      if (savedSelectedFont != nil) {
+      if (savedSelectedFont)
 	[fontManager setSelectedFont:savedSelectedFont
 			  isMultiple:savedIsMultiple];
-      } else {
-	NSLog(@"No saved font selection, skipping");
-      }
       MRC_RELEASE (savedSelectedFont);
       [fontPanel close];
     });
@@ -12412,15 +12516,10 @@ mac_put_selection_value (Selection sel, Lisp_Object target, Lisp_Object value)
 
   [pboard addTypes:@[dataType] owner:nil];
 
-  if (dataType == nil)
-    return noTypeErr;
-  else
-    {
-      NSData *data = [NSData dataWithBytes:(SDATA (value))
-				    length:(SBYTES (value))];
+  NSData *data = [NSData dataWithBytes:(SDATA (value))
+				length:(SBYTES (value))];
 
-      return [pboard setData:data forType:dataType] ? noErr : noTypeErr;
-    }
+  return [pboard setData:data forType:dataType] ? noErr : noTypeErr;
 }
 
 /* Check if data for the target type TARGET is available in SEL.  */
@@ -13296,6 +13395,15 @@ is_action_selector (SEL selector)
 {
   NSString *name = NSStringFromSelector (selector);
 
+  /* This runs on the GUI thread, including from synchronous
+     accessibility callbacks (e.g. menu inspection via
+     -respondsToSelector:).  Walking the keymaps below touches Lisp
+     data that the Lisp thread may be altering, so bail out during the
+     windows when such access is unsafe.  */
+  if ((poll_suppress_count == 0 && !NILP (Vinhibit_quit))
+      || gc_in_progress)
+    return NO;
+
   /* The selector name is of the form `ACTIONNAME:' ?  */
   if (NSMaxRange ([name rangeOfString:@":"]) == [name length])
     {
@@ -14139,6 +14247,10 @@ static NSDate *documentRasterizerCacheOldestTimestamp;
 
 @implementation EmacsSVGDocument
 
+/* Upper bound in seconds for waiting on web view load or snapshot
+   completion while pumping the run loop.  */
+#define SVG_WEB_VIEW_DEADLINE_INTERVAL 15
+
 /* WebView object that was used in the last deallocated
    EmacsSVGDocument object.  This is reused to avoid the overhead of
    WebView object creation.  */
@@ -14380,9 +14492,40 @@ static WebView *EmacsSVGDocumentLastWebView;
 #endif  /* !USE_WK_API */
 
   /* webView.isLoading is not sufficient if we have <image
-     xlink:href=... /> */
-  while (!finished)
-    mac_run_loop_run_once (0);
+     xlink:href=... />.  Pump the run loop until the navigation
+     finishes or fails, but give up after a deadline so a load
+     failure cannot leave us waiting forever.  */
+  {
+    NSDate *deadline =
+      [NSDate dateWithTimeIntervalSinceNow:SVG_WEB_VIEW_DEADLINE_INTERVAL];
+
+    while (!finished && !navigationFailed)
+      {
+	NSTimeInterval remaining = [deadline timeIntervalSinceNow];
+
+	if (remaining <= 0)
+	  break;
+	mac_run_loop_run_once (min (remaining, 0.1));
+      }
+
+    if (!finished && !navigationFailed)
+      {
+	/* The navigation is still in flight after the deadline.  Stop
+	   it, detach the delegate, and discard the web view so its
+	   late callbacks cannot affect the next document that would
+	   reuse the shared web view.  */
+#ifdef USE_WK_API
+	[webView stopLoading];
+	webView.navigationDelegate = nil;
+	self.finishNavigationHandler = nil;
+#else
+	[webView stopLoading:nil];
+	webView.frameLoadDelegate = nil;
+	self.finishLoadForFrameHandler = nil;
+#endif
+	EmacsSVGDocumentLastWebView = nil;
+      }
+  }
 
   int width = -1, height;
 #ifdef USE_WK_API
@@ -14533,6 +14676,7 @@ static WebView *EmacsSVGDocumentLastWebView;
       ctm = CGAffineTransformConcat (flip, ctm);
 
       BOOL __block finished = NO;
+      BOOL __block stale = NO;
       NSImage * __block image = nil;
       int destWidth = NSWidth (destRect), destHeight = NSHeight (destRect);
       NSString *script = [NSString stringWithFormat:@""
@@ -14550,7 +14694,13 @@ static WebView *EmacsSVGDocumentLastWebView;
 
       [webView evaluateJavaScript:script
 		completionHandler:^(id scriptResult, NSError *error) {
-	  if (!error)
+	  if (stale)
+	    /* The request already timed out.  */
+	    return;
+	  if (error)
+	    /* Give up drawing this page; image remains nil.  */
+	    finished = YES;
+	  else
 	    {
 	      WKSnapshotConfiguration *snapshotConfiguration =
 		[[WKSnapshotConfiguration alloc] init];
@@ -14560,6 +14710,9 @@ static WebView *EmacsSVGDocumentLastWebView;
 	      [webView takeSnapshotWithConfiguration:snapshotConfiguration
 				   completionHandler:^(NSImage *snapshotImage,
 						       NSError *error) {
+		  if (stale)
+		    /* The request already timed out.  */
+		    return;
 		  image = MRC_RETAIN (snapshotImage);
 		  finished = YES;
 		}];
@@ -14567,8 +14720,27 @@ static WebView *EmacsSVGDocumentLastWebView;
 	    }
 	}];
 
-      while (!finished)
-	mac_run_loop_run_once (0);
+      /* Pump the run loop until the snapshot completes, but give up
+	 after a deadline so an error cannot leave us waiting
+	 forever.  */
+      {
+	NSDate *deadline =
+	  [NSDate dateWithTimeIntervalSinceNow:SVG_WEB_VIEW_DEADLINE_INTERVAL];
+
+	while (!finished)
+	  {
+	    NSTimeInterval remaining = [deadline timeIntervalSinceNow];
+
+	    if (remaining <= 0)
+	      break;
+	    mac_run_loop_run_once (min (remaining, 0.1));
+	  }
+      }
+
+      /* Make any late completion handlers no-ops.  The shared web
+	 view may be in use for another page by now, and on non-ARC
+	 builds a late snapshot would also leak the retained image.  */
+      stale = YES;
 
       if (image)
 	{
@@ -14622,6 +14794,18 @@ static WebView *EmacsSVGDocumentLastWebView;
       finishNavigationHandler (view, navigation);
       self.finishNavigationHandler = nil;
     }
+}
+
+- (void)webView:(WKWebView *)view didFailNavigation:(WKNavigation *)navigation
+      withError:(NSError *)error
+{
+  navigationFailed = YES;
+}
+
+- (void)webView:(WKWebView *)view didFailProvisionalNavigation:(WKNavigation *)navigation
+      withError:(NSError *)error
+{
+  navigationFailed = YES;
 }
 
 - (void)webView:(WKWebView *)view startURLSchemeTask:(id <WKURLSchemeTask>)urlSchemeTask
@@ -14703,6 +14887,18 @@ static WebView *EmacsSVGDocumentLastWebView;
       finishLoadForFrameHandler (sender, frame);
       self.finishLoadForFrameHandler = nil;
     }
+}
+
+- (void)webView:(WebView *)sender didFailLoadWithError:(NSError *)error
+       forFrame:(WebFrame *)frame
+{
+  navigationFailed = YES;
+}
+
+- (void)webView:(WebView *)sender didFailProvisionalLoadWithError:(NSError *)error
+       forFrame:(WebFrame *)frame
+{
+  navigationFailed = YES;
 }
 #endif
 
@@ -15640,6 +15836,14 @@ ax_get_bounds_for_range_1 (EmacsMainView *emacsView, NSRange range)
   while (actualRange.length > 0)
     {
       NSRect rect1;
+
+      /* Bail out on a degenerate actual range that is not contained
+	 in the requested range or does not advance, so as to avoid
+	 unbounded recursion or iteration.  */
+      if (actualRange.location < range.location
+	  || NSMaxRange (actualRange) > NSMaxRange (range)
+	  || NSMaxRange (actualRange) <= range.location)
+	break;
 
       if (actualRange.location > range.location)
 	{
@@ -16723,7 +16927,14 @@ mac_init_thread_synchronization (void)
 
 /* Keep synchronously executing blocks in `mac_gui_queue', which has
    been set by `mac_within_gui_and_here', in the GUI thread until the
-   dequeued block is nil.  */
+   dequeued block is nil.
+
+   A nil block terminates the innermost mac_gui_loop.  It is only
+   enqueued (via `mac_within_gui (nil)') while the GUI thread is known
+   to be inside a mac_gui_loop nested in `mac_within_lisp'.  If a nil
+   block ever reached the top-level mac_gui_loop in main, it would
+   return and Emacs would abort.  If it reached mac_gui_loop_once,
+   that would be a protocol violation, and it aborts explicitly.  */
 
 static void
 mac_gui_loop (void)
@@ -16752,7 +16963,10 @@ mac_gui_loop_once (void)
   BEGIN_AUTORELEASE_POOL;
   dispatch_semaphore_wait (mac_gui_semaphore, DISPATCH_TIME_FOREVER);
   block = [mac_gui_queue dequeue];
-  eassert (block);
+  if (block == nil)
+    /* A nil block is reserved for terminating a mac_gui_loop nested
+       in mac_within_lisp.  It must never reach this consumer.  */
+    emacs_abort ();
   block ();
   dispatch_semaphore_signal (mac_lisp_semaphore);
   END_AUTORELEASE_POOL;

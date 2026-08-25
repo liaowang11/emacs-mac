@@ -30828,7 +30828,13 @@ get_glyph_face_and_encoding (struct frame *f, struct glyph *glyph,
   struct face *face;
   unsigned code = 0;
 
-  face = FACE_FROM_ID (f, glyph->face_id);
+  face = FACE_FROM_ID_OR_NULL (f, glyph->face_id);
+
+  /* The glyph matrix can still reference a face whose cache slot was
+     freed, e.g. by realize_face removing a former face, before the
+     matrix is redrawn.  Fall back to the default face then.  */
+  if (face == NULL)
+    face = FACE_FROM_ID (f, DEFAULT_FACE_ID);
 
   /* Make sure X resources of the face are allocated.  */
   prepare_face_for_display (f, face);
