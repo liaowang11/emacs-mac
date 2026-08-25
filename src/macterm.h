@@ -612,6 +612,8 @@ extern Lisp_Object mac_nsobject_to_lisp (CFTypeRef);
 extern void mac_alert_sound_play (void);
 extern double mac_appkit_version (void);
 extern double mac_system_uptime (void);
+extern unsigned int mac_block_system_sleep (Lisp_Object, bool);
+extern bool mac_unblock_system_sleep (unsigned int);
 extern bool mac_is_current_process_frontmost (void);
 extern void mac_bring_current_process_to_front (bool);
 extern bool mac_trash_file (const char *, CFErrorRef *);
