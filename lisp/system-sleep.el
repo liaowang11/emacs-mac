@@ -242,6 +242,10 @@ The block is unblocked when BODY completes."
              (system-sleep--enable))
         (keymap-set special-event-map "<sleep-event>"
                     #'system-sleep--sleep-event-handler)
+      ;; Forget the back end that `system-sleep--set-back-end' picked,
+      ;; so that later calls report no support instead of warning about
+      ;; every single block attempt.
+      (setq system-sleep--back-end nil)
       (warn "`system-sleep' could not be initialized"))))
 
 (defun system-sleep-disable ()
