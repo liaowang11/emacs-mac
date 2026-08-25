@@ -961,6 +961,86 @@ mac_system_uptime (void)
   return [[NSProcessInfo processInfo] systemUptime];
 }
 
+/* A unique id for each system sleep block, and a map from that id to
+   the opaque activity token that NSProcessInfo returned for it.  The
+   map retains the token, which is needed to end the activity.  */
+
+static unsigned int mac_sleep_block_last_id;
+static NSMutableDictionaryOf (NSNumber *, id) *mac_sleep_block_map;
+
+/* Block system idle sleep with the reason WHY.  Also keep the display
+   active unless ALLOW_DISPLAY_SLEEP_P.  Return a non-zero token for
+   the block, or 0 if it could not be established.  */
+
+unsigned int
+mac_block_system_sleep (Lisp_Object why, bool allow_display_sleep_p)
+{
+  unsigned int __block result = 0;
+  CFStringRef reason;
+
+  if (NSApp == nil)
+    return result;
+
+  /* This may GC, so it has to be done in the Lisp thread.  */
+  reason = cfstring_create_with_string (why);
+
+  mac_within_gui (^{
+      NSActivityOptions options = (NSActivityUserInitiated
+				   | NSActivityIdleSystemSleepDisabled);
+
+      if (!allow_display_sleep_p)
+	options |= NSActivityIdleDisplaySleepDisabled;
+
+      id activity =
+	[[NSProcessInfo processInfo]
+	  beginActivityWithOptions:options
+			    reason:(((__bridge NSString *) reason)
+				    ?: @"Emacs")];
+
+      if (activity)
+	{
+	  if (mac_sleep_block_map == nil)
+	    mac_sleep_block_map =
+	      [[NSMutableDictionary alloc] initWithCapacity:1];
+	  result = ++mac_sleep_block_last_id;
+	  [mac_sleep_block_map setObject:activity
+				  forKey:[NSNumber
+					   numberWithUnsignedInt:result]];
+	}
+    });
+
+  if (reason)
+    CFRelease (reason);
+
+  return result;
+}
+
+/* Release the system sleep block that TOKEN was returned for.  Return
+   true if it was released.  */
+
+bool
+mac_unblock_system_sleep (unsigned int token)
+{
+  bool __block result = false;
+
+  if (NSApp == nil)
+    return result;
+
+  mac_within_gui (^{
+      NSNumber *key = [NSNumber numberWithUnsignedInt:token];
+      id activity = [mac_sleep_block_map objectForKey:key];
+
+      if (activity)
+	{
+	  [[NSProcessInfo processInfo] endActivity:activity];
+	  [mac_sleep_block_map removeObjectForKey:key];
+	  result = true;
+	}
+    });
+
+  return result;
+}
+
 bool
 mac_is_current_process_frontmost (void)
 {
@@ -1259,6 +1339,12 @@ static bool handling_queued_nsevents_p;
 	   name:NSWorkspaceWillSleepNotification
 	 object:nil];
 
+  [[[NSWorkspace sharedWorkspace] notificationCenter]
+    addObserver:self
+       selector:@selector(didWake:)
+	   name:NSWorkspaceDidWakeNotification
+	 object:nil];
+
   [NSApp registerUserInterfaceItemSearchHandler:self];
   Vmac_help_topics = Qnil;
 
@@ -1351,11 +1437,33 @@ static bool handling_queued_nsevents_p;
   macfont_update_antialias_threshold ();
 }
 
+/* Store a sleep event with STATE, which is either `pre-sleep' or
+   `post-wake', to kbd_buffer.  */
+
+- (void)storeSleepEventWithState:(Lisp_Object)state
+{
+  mac_within_lisp_deferred_unless_popup (^{
+      struct input_event inev;
+
+      EVENT_INIT (inev);
+      inev.kind = SLEEP_EVENT;
+      inev.arg = list1 (state);
+      [self storeEvent:&inev];
+    });
+}
+
 - (void)willSleep:(NSNotification *)notification
 {
   /* Make sure no drawing is left in flight on the drawing queue
      before the machine goes to sleep.  */
   mac_draw_queue_sync ();
+
+  [self storeSleepEventWithState:Qpre_sleep];
+}
+
+- (void)didWake:(NSNotification *)notification
+{
+  [self storeSleepEventWithState:Qpost_wake];
 }
 
 - (void)updateObservedKeyPaths

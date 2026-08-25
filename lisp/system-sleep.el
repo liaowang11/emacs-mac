@@ -203,7 +203,8 @@ The block is unblocked when BODY completes."
   ;; Order matters to accommodate the cases where an NS or MS-Windows
   ;; build have the dbus feature.
   (setq system-sleep--back-end
-        (cond ((featurep 'ns) 'ns)
+        (cond ((featurep 'mac) 'mac)
+              ((featurep 'ns) 'ns)
               ((featurep 'w32) 'w32)
               ((and (featurep 'dbusbind)
                     (require 'dbus))
@@ -466,6 +467,53 @@ The default is \"sleep\" which is compatible with the other supported
     nil))
 
 
+;; macOS Mac port support.
+
+(declare-function mac-application-state "macfns.c")
+(declare-function mac-block-system-sleep "macfns.c")
+(declare-function mac-unblock-system-sleep "macfns.c")
+
+(cl-defmethod system-sleep--enable (&context
+                                    (system-sleep--back-end (eql 'mac)))
+  ;; Sleep blocks are established through the application object, which
+  ;; only exists when Emacs runs as a GUI application.  Report failure
+  ;; otherwise, so that a batch or terminal session says so once instead
+  ;; of warning on every block attempt.
+  (and (mac-application-state) t))
+
+(cl-defmethod system-sleep--disable (&context
+                                     (system-sleep--back-end (eql 'mac)))
+  (ignore))
+
+(cl-defmethod system-sleep--block-sleep (why
+                                         allow-display-sleep
+                                         &context
+                                         (system-sleep--back-end (eql 'mac)))
+  (if-let* ((cookie (mac-block-system-sleep why allow-display-sleep))
+            (token (list :system 'mac :why why
+                         :token (cons 'mac-sleep-block cookie))))
+      (progn
+        (let ((inhibit-quit t))
+          (push token system-sleep--sleep-block-tokens))
+        token)
+    (warn "Unable to block system sleep")))
+
+(cl-defmethod system-sleep--unblock-sleep (token
+                                           &context
+                                           (system-sleep--back-end (eql 'mac)))
+  (if (memq token system-sleep--sleep-block-tokens)
+      (progn
+        (let ((inhibit-quit t))
+          (setq system-sleep--sleep-block-tokens
+                (remq token system-sleep--sleep-block-tokens)))
+        (if (mac-unblock-system-sleep (cdr (plist-get token :token)))
+            t
+          (warn "Unable to unblock system sleep (blocks are released when Emacs dies)")
+          nil))
+    (warn "Unknown `system-sleep' sleep token")
+    nil))
+
+
 ;; MS-Windows support.
 
 (declare-function w32-block-system-sleep "w32fns.c")
