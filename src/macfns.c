@@ -5000,6 +5000,49 @@ sent.  It will be useful in the `:enable' property of a menu item.  */)
 
 
 /***********************************************************************
+			     System Sleep
+ ***********************************************************************/
+
+DEFUN ("mac-block-system-sleep", Fmac_block_system_sleep,
+       Smac_block_system_sleep, 2, 2, 0,
+       doc: /* Block system idle sleep.
+WHY is a string reason for the block, or nil for the default reason.
+If ALLOW-DISPLAY-SLEEP is non-nil, let the display sleep while the
+system is kept awake.
+Return a token to unblock this block using `mac-unblock-system-sleep',
+or nil if the block fails.  */)
+  (Lisp_Object why, Lisp_Object allow_display_sleep)
+{
+  unsigned int token;
+
+  if (NILP (why))
+    why = build_string ("Emacs");
+  CHECK_STRING (why);
+
+  token = mac_block_system_sleep (why, !NILP (allow_display_sleep));
+
+  return token ? make_fixnum (token) : Qnil;
+}
+
+DEFUN ("mac-unblock-system-sleep", Fmac_unblock_system_sleep,
+       Smac_unblock_system_sleep, 1, 1, 0,
+       doc: /* Unblock system idle sleep.
+TOKEN is an object returned by `mac-block-system-sleep'.
+Return non-nil if the TOKEN block was unblocked.  */)
+  (Lisp_Object token)
+{
+  EMACS_INT id;
+
+  CHECK_FIXNAT (token);
+  id = XFIXNAT (token);
+  if (id == 0 || id > UINT_MAX)
+    return Qnil;
+
+  return mac_unblock_system_sleep (id) ? Qt : Qnil;
+}
+
+
+/***********************************************************************
 			      Tab Group
  ***********************************************************************/
 
@@ -5563,5 +5606,7 @@ respectively.  */);
   defsubr (&Smac_set_frame_tab_group_property);
   defsubr (&Smac_frame_tab_group_property);
   defsubr (&Smac_send_action);
+  defsubr (&Smac_block_system_sleep);
+  defsubr (&Smac_unblock_system_sleep);
   defsubr (&Smac_start_animation);
 }
